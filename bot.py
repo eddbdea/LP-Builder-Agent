@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from claude_agent_sdk import (
     query,
     ClaudeAgentOptions,
@@ -59,7 +59,7 @@ optiuni = ClaudeAgentOptions(
 ultima_limita = {}
 
 
-# 5. Textul cu limita, afișat sub fiecare răspuns
+# 5. Textul cu limita (pentru comanda /usage)
 def text_limita():
     if not ultima_limita:
         return ""
@@ -87,7 +87,7 @@ async def intreaba_claude(text):
                     raspuns += bucata.text + "\n"
         if isinstance(mesaj, RateLimitEvent):
             ultima_limita["info"] = mesaj.rate_limit_info
-    return (raspuns.strip() or "(n-am primit răspuns)") + text_limita()
+    return raspuns.strip() or "(n-am primit răspuns)"
 
 
 # 7. Ce face botul la fiecare mesaj
@@ -103,8 +103,20 @@ async def raspunde(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(raspuns[i:i + 4000])
 
 
-# 8. Pornim botul
+# 8. Comanda /usage: arată limita abonamentului
+async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id not in ALLOWED_IDS:
+        return
+    text = text_limita()
+    if not text:
+        text = ("Încă n-am primit de la Claude informații despre limită în această pornire a botului.\n"
+                "Le vezi oricând pe claude.ai → Settings → Usage.")
+    await update.message.reply_text(text.strip(" —\n"))
+
+
+# 9. Pornim botul
 app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT, raspunde))
+app.add_handler(CommandHandler("usage", usage))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, raspunde))
 print("Botul a pornit. Control+C ca să-l oprești.")
 app.run_polling()
