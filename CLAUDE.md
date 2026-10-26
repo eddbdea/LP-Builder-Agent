@@ -140,7 +140,21 @@ Handle-ul se scrie cu litere mici, fără diacritice, cu cratime. Fără unită�
 
 ### 3.4 Pune șablonul în tema live
 
-**Important:** API-ul (`themeFilesUpsert`) **refuză scrierea în tema live**. De aceea șablonul se creează din **editorul de cod Shopify**, în browserul integrat (built-in browser):
+**Varianta A – prin API (o încerci prima).** Cu unealta `shopify_graphql` (tokenul aplicației SuperPractic are drept `write_themes`):
+
+```graphql
+mutation up($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
+  themeFilesUpsert(themeId: $themeId, files: $files) {
+    upsertedThemeFiles { filename } userErrors { field message }
+  }
+}
+```
+
+Variabile: `{"themeId": "gid://shopify/OnlineStoreTheme/<ID_TEMA_LIVE>", "files": [{"filename": "templates/product.lp-<nume-scurt>.json", "body": {"type": "TEXT", "value": "<JSON-ul minificat>"}}]}`.
+
+Dacă `userErrors` e gol, citește fișierul înapoi și verifică textele, apoi treci la 3.5. Dacă Shopify refuză scrierea în tema live, folosește varianta B.
+
+**Varianta B – din editorul de cod Shopify**, în browserul integrat (built-in browser), dacă ai acces la el:
 
 1. Deschide `https://admin.shopify.com/store/chinaboys-4/themes/<ID_TEMA_LIVE>?key=templates/product.landing-nou.json`. Fereastra browserului trebuie să fie lată (fără emulare de mobil), altfel click-urile nu merg.
 2. Click dreapta pe folderul **templates** → **New File...** → scrie `product.lp-<nume-scurt>.json` → Enter.
