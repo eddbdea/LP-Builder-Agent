@@ -148,11 +148,11 @@ Handle-ul se scrie cu litere mici, fără diacritice, cu cratime. Fără unită�
 | `faq.blocks.q1..q7.settings` | `heading`, `row_content` | întrebările (`row_content` e `<p>…</p>`) |
 
 3. Nu schimba secțiunile `reviews` (rămâne dezactivată) și `brand`.
-4. Salvează local versiunea minificată (`json.dumps(..., ensure_ascii=False, separators=(',',':'))`) și notează-i **lungimea în caractere**.
+4. Pregătește JSON-ul complet, valid, pe un singur rând (fără comentariul de la început).
 
 ### 3.4 Pune șablonul în tema live
 
-**Varianta A – prin API (o încerci prima).** Cu unealta `shopify_graphql` (tokenul aplicației SuperPractic are drept `write_themes`):
+Cu unealta `shopify_graphql` (tokenul aplicației SuperPractic are drept `write_themes`):
 
 ```graphql
 mutation up($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
@@ -164,18 +164,9 @@ mutation up($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
 
 Variabile: `{"themeId": "gid://shopify/OnlineStoreTheme/<ID_TEMA_LIVE>", "files": [{"filename": "templates/product.lp-<nume-scurt>.json", "body": {"type": "TEXT", "value": "<JSON-ul minificat>"}}]}`.
 
-Dacă `userErrors` e gol, citește fișierul înapoi și verifică textele, apoi treci la 3.5. Dacă Shopify refuză scrierea în tema live, folosește varianta B.
+Dacă `userErrors` e gol, citește fișierul înapoi și verifică textele, apoi treci la 3.5.
 
-**Varianta B – din editorul de cod Shopify**, în browserul integrat (built-in browser), dacă ai acces la el:
-
-1. Deschide `https://admin.shopify.com/store/chinaboys-4/themes/<ID_TEMA_LIVE>?key=templates/product.landing-nou.json`. Fereastra browserului trebuie să fie lată (fără emulare de mobil), altfel click-urile nu merg.
-2. Click dreapta pe folderul **templates** → **New File...** → scrie `product.lp-<nume-scurt>.json` → Enter.
-3. Fișierul nou se deschide cu un conținut implicit. Dă click în editor, apoi `cmd+a` și `Delete`.
-4. Tastează JSON-ul minificat (acțiunea `type`). Pentru câmpurile cu mai multe rânduri, scrie în text **un singur backslash urmat de n** (`\n`), nu două.
-5. Verifică în bara de jos că `Col` = lungimea + 1. Dacă diferă, caută greșeala (de obicei backslash-uri dublate). Le poți corecta cu Find/Replace: `cmd+alt+f`, apoi Enter în câmpul Replace pentru fiecare potrivire.
-   - **Atenție:** pe Mac, `ctrl+h` șterge un caracter. Nu-l folosi.
-6. Click pe **Save** (dreapta sus). Tab-ul nu mai are bulina ● când s-a salvat.
-7. **Verifică prin API** că fișierul există și că textele sunt corecte: citește `templates/product.lp-<nume-scurt>.json`. Dacă editorul arată o eroare, dar fișierul citit prin API e complet și valid, eroarea din editor e doar vizuală.
+**Dacă Shopify refuză scrierea** (eroare de acces, „blocked”, „exemption” etc.): nu insista și nu încerca alte metode. Spune-i utilizatorului exact eroarea primită și că șablonul trebuie pus manual din editorul de cod Shopify (Online Store → Themes → … → Edit code → templates → New file). Dă-i numele fișierului și JSON-ul complet ca să-l poată lipi.
 
 ### 3.5 Atribuie șablonul produsului
 
@@ -186,6 +177,24 @@ mutation {
   }
 }
 ```
+
+---
+
+## 3bis. Actualizarea unui landing page existent
+
+Când utilizatorul cere să modifici sau să aduci la zi pagina unui produs existent (de ex. „adu Molistop la zi cu celelalte”):
+
+1. Găsește produsul (`products(first: 5, query: "title:*<nume>*")`) și citește-i `templateSuffix`.
+2. Citește din tema live șablonul lui (`templates/product.<templateSuffix>.json`) și șablonul de referință `templates/product.landing-nou.json`.
+3. Compară-le. Ce înseamnă „la zi”:
+   - aceleași secțiuni și în aceeași ordine ca în `landing-nou` (hero, features, steps, comparison, reviews, faq, brand);
+   - aceleași setări de design (culori, spațieri, coloane, setări de afișare) ca în `landing-nou`;
+   - **textele, pozele și handle-ul din `comparison.settings.atc_product` rămân ale produsului**, nu le copia de la CurățăPVC.
+4. **Înainte să scrii ceva**, arată-i utilizatorului pe scurt ce schimbi (listă cu modificările) și cere-i aprobarea.
+5. După aprobare, scrie șablonul cu `themeFilesUpsert` (ca la 3.4), apoi citește-l înapoi și verifică.
+6. Dacă produsul folosește un șablon vechi, fără `lp-hero`, nu-l transforma singur: spune-i utilizatorului și întreabă dacă vrea pagină nouă, cu textul mutat în formatul nou.
+
+Designul comun (butoane, bandă finală, meniu, culori) e în fișierele comune ale temei și se aplică automat tuturor paginilor `lp-`. Pe acelea nu le modifici.
 
 ---
 
