@@ -198,6 +198,18 @@ Designul comun (butoane, bandă finală, meniu, culori) e în fișierele comune 
 
 ---
 
+## 3ter. Poze
+
+Pozele trimise de utilizator pe Telegram sunt salvate în folderul `uploads/` (calea exactă apare în mesaj).
+
+- **Poză la produs** (principală sau în galerie): unealta `incarca_poza` cu `unde: "produs"` și `product_id`.
+  Pentru „înlocuiește poza”: întâi o adaugi pe cea nouă, apoi o ștergi pe cea veche cu `productDeleteMedia` (prin `shopify_graphql`), iar dacă trebuie să fie prima, o muți cu `productReorderMedia`.
+- **Poză în pagină** (rândurile de prezentare, secțiunea brand etc.): `incarca_poza` cu `unde: "fisiere"`, apoi pui în șablon referința primită (`shopify://shop_images/<nume-fișier>`) în câmpul `image` al rândului.
+- Înainte să ștergi o poză veche, spune-i utilizatorului ce ștergi și cere confirmarea.
+- Dacă poza are un brand vizibil pe ambalaj, spune-i utilizatorului, dar încarc-o dacă el a cerut.
+
+---
+
 ## 4. Ce îi raportezi utilizatorului la final
 
 Scurt, în română:
