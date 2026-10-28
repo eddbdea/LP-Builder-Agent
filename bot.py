@@ -3,10 +3,14 @@
 # Are unealta Shopify, ține minte conversația până dai /nou, vede pozele și arată ce face pe parcurs
 # (pasul curent + cât timp lucrează), iar în terminal scrie fiecare pas și erorile complete.
 # Poate încărca în Shopify pozele primite pe Telegram (la produs sau în Content → Files).
+# Are butoane „Aprob/Modific” și unealta creeaza_pagina, care face toată pagina dintr-o mișcare.
 
 # 1. Importuri
 import asyncio
+import html
+import json
 import logging
+import re
 import mimetypes
 import os
 import time
@@ -15,9 +19,10 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import (ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
+                          ContextTypes, filters)
 from claude_agent_sdk import (
     ClaudeSDKClient,      # conversație care ține minte mesajele
     ClaudeAgentOptions,
@@ -204,19 +209,234 @@ async def incarca_poza(args):
     )
 
 
-server_shopify = create_sdk_mcp_server(name="shopify", version="1.0.0", tools=[shopify_graphql, incarca_poza])
+# 4c. NOU: creează pagina dintr-o singură mișcare
+# Claude scrie doar textele; codul face restul: produsul, șablonul, urcarea în temă, atribuirea, verificarea.
+SABLON_BAZA = "templates/product.landing-nou.json"
+
+
+def paragraf(text):
+    text = (text or "").strip()
+    return text if text.startswith("<p>") else f"<p>{text}</p>"
+
+
+def gros(text):
+    text = (text or "").strip()
+    return text if text.startswith("<strong>") else f"<strong>{text}</strong>"
+
+
+def fara_comentariu(continut):
+    return json.loads(re.sub(r"^\s*/\*.*?\*/", "", continut, flags=re.S))
+
+
+async def tema_live():
+    r = await graphql("{ themes(first: 20) { nodes { id name role } } }")
+    for t in r["data"]["themes"]["nodes"]:
+        if t["role"] == "MAIN":
+            return t["id"], t["name"]
+    raise RuntimeError("Nu am găsit tema live (MAIN).")
+
+
+async def citeste_fisier_tema(theme_id, nume):
+    r = await graphql(
+        """query($id: ID!, $f: [String!]) { theme(id: $id) { files(filenames: $f, first: 1) {
+             nodes { filename body { ... on OnlineStoreThemeFileBodyText { content } } } } } }""",
+        {"id": theme_id, "f": [nume]},
+    )
+    noduri = (((r.get("data") or {}).get("theme") or {}).get("files") or {}).get("nodes") or []
+    return noduri[0]["body"]["content"] if noduri else None
+
+
+def completeaza_sablon(baza, a, handle, poze_vechi):
+    S = baza["sections"]
+    handle_vechi = S["comparison"]["settings"].get("atc_product", "")
+
+    S["hero"]["settings"]["benefits"] = "\n".join(b.strip() for b in a["beneficii"])
+
+    S["features"]["settings"]["title"] = a["cum_functioneaza"]["titlu"]
+    S["features"]["settings"]["text"] = paragraf(a["cum_functioneaza"]["text"])
+    for i, rand in enumerate(a["randuri"][:4], start=1):
+        s = S["features"]["blocks"][f"r{i}"]["settings"]
+        s["caption"] = rand["eticheta"]
+        s["title"] = rand["titlu"]
+        s["text"] = paragraf(rand["text"])
+        s["chips"] = "\n".join(rand["chips"])
+        s["image"] = poze_vechi.get(f"r{i}", "")
+
+    pasi = S["steps"]
+    model_pas = json.loads(json.dumps(pasi["blocks"]["s1"]))
+    pasi["blocks"], pasi["block_order"] = {}, []
+    for i, pas in enumerate(a["pasi"][:4], start=1):
+        bloc = json.loads(json.dumps(model_pas))
+        titlu = pas["titlu"].strip()
+        bloc["settings"]["title"] = titlu if re.match(r"^\d+\.", titlu) else f"{i}. {titlu}"
+        bloc["settings"]["text"] = paragraf(pas["text"])
+        pasi["blocks"][f"s{i}"] = bloc
+        pasi["block_order"].append(f"s{i}")
+    pasi["settings"]["columns_desktop"] = len(pasi["block_order"])
+    pasi["settings"]["title"] = f"Se folosește în {len(pasi['block_order'])} pași"
+
+    c = a["comparatie"]
+    cs = S["comparison"]["settings"]
+    cs["title"], cs["text"] = c["titlu"], paragraf(c["text"])
+    cs["us_label"], cs["others_label"] = c["eticheta_noi"], c["eticheta_ei"]
+    for i, rand in enumerate(c["randuri"][:4], start=1):
+        S["comparison"]["blocks"][f"r{i}"]["settings"]["benefit"] = gros(rand)
+
+    faq = S["faq"]
+    model_q = json.loads(json.dumps(next(iter(faq["blocks"].values()))))
+    faq["blocks"], faq["block_order"] = {}, []
+    for i, q in enumerate(a["faq"][:8], start=1):
+        bloc = json.loads(json.dumps(model_q))
+        bloc["settings"]["heading"], bloc["settings"]["row_content"] = q["intrebare"], paragraf(q["raspuns"])
+        faq["blocks"][f"q{i}"] = bloc
+        faq["block_order"].append(f"q{i}")
+
+    # orice buton legat de produsul vechi (CurățăPVC) trece pe produsul nou
+    for sectiune in S.values():
+        for cheie, valoare in sectiune.get("settings", {}).items():
+            if cheie in ("atc_product", "product") and valoare and valoare == handle_vechi:
+                sectiune["settings"][cheie] = handle
+    cs["atc_product"] = handle
+    return baza
+
+
+@tool(
+    "creeaza_pagina",
+    "Pasul 3 dintr-o singură mișcare, DOAR după aprobarea copy-ului. Primește textele aprobate exact cum sunt "
+    "și face singur: produsul în ciornă (preț 0), șablonul templates/product.lp-<nume_scurt>.json din landing-nou, "
+    "urcarea în tema live, atribuirea la produs și verificarea. Pentru corecturi la o pagină deja creată, "
+    "trimite și product_id; pozele puse deja în rânduri se păstrează. Textele pot conține <strong>.",
+    {
+        "type": "object",
+        "properties": {
+            "titlu": {"type": "string"},
+            "handle": {"type": "string", "description": "litere mici, fără diacritice, cu cratime"},
+            "tip_produs": {"type": "string"},
+            "nume_scurt": {"type": "string", "description": "ex. 'tableta' -> șablonul lp-tableta"},
+            "product_id": {"type": "string", "description": "doar pentru corecturi la un produs existent"},
+            "beneficii": {"type": "array", "items": {"type": "string"}, "minItems": 4, "maxItems": 4},
+            "cum_functioneaza": {"type": "object", "properties": {"titlu": {"type": "string"}, "text": {"type": "string"}},
+                                 "required": ["titlu", "text"]},
+            "randuri": {"type": "array", "minItems": 4, "maxItems": 4, "items": {
+                "type": "object",
+                "properties": {"eticheta": {"type": "string"}, "titlu": {"type": "string"},
+                               "text": {"type": "string"}, "chips": {"type": "array", "items": {"type": "string"}}},
+                "required": ["eticheta", "titlu", "text", "chips"]}},
+            "pasi": {"type": "array", "minItems": 3, "maxItems": 4, "items": {
+                "type": "object", "properties": {"titlu": {"type": "string"}, "text": {"type": "string"}},
+                "required": ["titlu", "text"]}},
+            "comparatie": {"type": "object", "properties": {
+                "titlu": {"type": "string"}, "text": {"type": "string"},
+                "eticheta_noi": {"type": "string"}, "eticheta_ei": {"type": "string"},
+                "randuri": {"type": "array", "items": {"type": "string"}, "minItems": 4, "maxItems": 4}},
+                "required": ["titlu", "text", "eticheta_noi", "eticheta_ei", "randuri"]},
+            "faq": {"type": "array", "minItems": 7, "maxItems": 8, "items": {
+                "type": "object", "properties": {"intrebare": {"type": "string"}, "raspuns": {"type": "string"}},
+                "required": ["intrebare", "raspuns"]}},
+        },
+        "required": ["titlu", "handle", "tip_produs", "nume_scurt", "beneficii", "cum_functioneaza",
+                     "randuri", "pasi", "comparatie", "faq"],
+    },
+)
+async def creeaza_pagina(a):
+    pasi_facuti = []
+    try:
+        nume_scurt = re.sub(r"[^a-z0-9-]", "", a["nume_scurt"].lower().replace("lp-", "", 1))
+        sufix = f"lp-{nume_scurt}"
+        fisier = f"templates/product.{sufix}.json"
+        handle = a["handle"]
+        theme_id, theme_nume = await tema_live()
+        pasi_facuti.append(f"Tema live: {theme_nume}")
+
+        existent = await citeste_fisier_tema(theme_id, fisier)
+        poze_vechi = {}
+        if existent and not a.get("product_id"):
+            return raspuns_unealta(f"OPRIT: șablonul {fisier} există deja și aparține altui produs. "
+                                  "Alege alt nume_scurt sau trimite product_id dacă e o corectură.")
+        if existent:
+            vechi = fara_comentariu(existent)
+            for k, b in vechi["sections"].get("features", {}).get("blocks", {}).items():
+                if b.get("settings", {}).get("image"):
+                    poze_vechi[k] = b["settings"]["image"]
+
+        baza_text = await citeste_fisier_tema(theme_id, SABLON_BAZA)
+        if not baza_text:
+            return raspuns_unealta(f"Nu găsesc {SABLON_BAZA} în tema live.")
+        sablon = completeaza_sablon(fara_comentariu(baza_text), a, handle, poze_vechi)
+        json_min = json.dumps(sablon, ensure_ascii=False, separators=(",", ":"))
+
+        # produsul
+        product_id = a.get("product_id")
+        if not product_id:
+            r = await graphql(
+                """mutation($p: ProductCreateInput!) { productCreate(product: $p) {
+                     product { id handle } userErrors { field message } } }""",
+                {"p": {"title": a["titlu"], "handle": handle, "status": "DRAFT",
+                       "vendor": "SuperPractic", "productType": a["tip_produs"]}},
+            )
+            rez = r["data"]["productCreate"]
+            if rez["userErrors"]:
+                return raspuns_unealta(f"Shopify n-a creat produsul: {rez['userErrors']}")
+            product_id, handle = rez["product"]["id"], rez["product"]["handle"]
+            pasi_facuti.append(f"Produs creat în ciornă: {product_id} (handle {handle})")
+            if handle != a["handle"]:
+                sablon = completeaza_sablon(fara_comentariu(baza_text), a, handle, poze_vechi)
+                json_min = json.dumps(sablon, ensure_ascii=False, separators=(",", ":"))
+
+        # șablonul în temă
+        r = await graphql(
+            """mutation($t: ID!, $f: [OnlineStoreThemeFilesUpsertFileInput!]!) {
+                 themeFilesUpsert(themeId: $t, files: $f) { upsertedThemeFiles { filename } userErrors { field message } } }""",
+            {"t": theme_id, "f": [{"filename": fisier, "body": {"type": "TEXT", "value": json_min}}]},
+        )
+        rez = (r.get("data") or {}).get("themeFilesUpsert")
+        if not rez or rez["userErrors"]:
+            return raspuns_unealta(
+                "\n".join(pasi_facuti) + f"\nSHOPIFY A REFUZAT ȘABLONUL: {rez['userErrors'] if rez else r.get('errors')}\n"
+                f"Utilizatorul trebuie să creeze manual fișierul {fisier} din editorul de cod, cu acest conținut:\n{json_min}"
+            )
+        pasi_facuti.append(f"Șablon urcat: {fisier}")
+
+        # atribuirea
+        r = await graphql(
+            """mutation($p: ProductUpdateInput!) { productUpdate(product: $p) {
+                 product { id templateSuffix onlineStorePreviewUrl } userErrors { field message } } }""",
+            {"p": {"id": product_id, "templateSuffix": sufix}},
+        )
+        rez = r["data"]["productUpdate"]
+        if rez["userErrors"]:
+            return raspuns_unealta("\n".join(pasi_facuti) + f"\nAtribuirea a eșuat: {rez['userErrors']}")
+        pasi_facuti.append(f"Șablon atribuit produsului ({sufix})")
+
+        # verificare: citim înapoi și comparăm
+        inapoi = fara_comentariu(await citeste_fisier_tema(theme_id, fisier) or "{}")
+        ok = (inapoi.get("sections", {}).get("comparison", {}).get("settings", {}).get("atc_product") == handle
+              and inapoi["sections"]["hero"]["settings"]["benefits"] == sablon["sections"]["hero"]["settings"]["benefits"])
+        pasi_facuti.append("Verificare: textele și butonul de comandă sunt corecte" if ok
+                           else "ATENȚIE: verificarea a găsit diferențe, uită-te în editor")
+        pasi_facuti.append(f"Previzualizare: {rez['product']['onlineStorePreviewUrl']}")
+        pasi_facuti.append(f"Poze păstrate în rânduri: {len(poze_vechi)}" if poze_vechi
+                           else "Pozele din rânduri sunt goale (le pune utilizatorul)")
+        return raspuns_unealta("GATA\n" + "\n".join(pasi_facuti))
+    except Exception as e:
+        log.exception("creeaza_pagina")
+        return raspuns_unealta("\n".join(pasi_facuti) + f"\nEROARE: {e}")
+
+
+server_shopify = create_sdk_mcp_server(name="shopify", version="1.0.0",
+                                       tools=[shopify_graphql, incarca_poza, creeaza_pagina])
 UNEALTA_SHOPIFY = "mcp__shopify__shopify_graphql"
 UNEALTA_POZA = "mcp__shopify__incarca_poza"
+UNEALTA_PAGINA = "mcp__shopify__creeaza_pagina"
 
 # 5. Al doilea agent: copywriter-ul (Opus) – are și Shopify
 copywriter = AgentDefinition(
-    description="Scrie copy-ul paginii de produs și creează pagina în Shopify, după CLAUDE.md. "
-                "Folosește-l pentru Pasul 2 și Pasul 3.",
+    description="Scrie copy-ul paginii de produs (Pasul 2) și orice modificare de text, după CLAUDE.md.",
     prompt="Ești copywriter-ul SuperPractic. Scrii copy-ul în formatul fix din CLAUDE.md, "
            "pentru clientul român, fără să inventezi nimic din ce nu e în research-ul primit. "
-           "La Pasul 3 creezi produsul și pagina cu unealta Shopify, exact după CLAUDE.md. "
-           "Răspunzi în română.",
-    tools=["Read", UNEALTA_SHOPIFY, UNEALTA_POZA],
+           "Întorci doar copy-ul complet, gata de afișat. Pagina în Shopify o face agentul principal "
+           "cu unealta creeaza_pagina. Răspunzi în română.",
+    tools=["Read", UNEALTA_SHOPIFY, UNEALTA_POZA, UNEALTA_PAGINA],
     model=MODEL_COPY,
     effort=EFFORT_COPY,
     background=False,     # NOU: agentul principal îl așteaptă să termine (nu-l lasă în fundal)
@@ -227,7 +447,7 @@ optiuni = ClaudeAgentOptions(
     cwd=str(FOLDER),
     setting_sources=["project"],
     mcp_servers={"shopify": server_shopify},
-    allowed_tools=["WebSearch", "WebFetch", "Agent", "Read", UNEALTA_SHOPIFY, UNEALTA_POZA],
+    allowed_tools=["WebSearch", "WebFetch", "Agent", "Read", UNEALTA_SHOPIFY, UNEALTA_POZA, UNEALTA_PAGINA],
     disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit", "TodoWrite"],
     agents={"copywriter": copywriter},
     max_turns=40,
@@ -286,6 +506,8 @@ def descrie_pasul(bucata):
         return "✍️ Copywriter-ul scrie…"
     if nume == "Read":
         return "👀 Mă uit la poză…"
+    if nume.endswith("creeaza_pagina"):
+        return "🏗 Creez produsul și pagina în Shopify…"
     if nume.endswith("incarca_poza"):
         return "🖼 Încarc poza în Shopify…"
     if nume.endswith("shopify_graphql"):
@@ -430,13 +652,68 @@ async def arata_progres(chat, stare, progres, stop):
             pass
 
 
+# 11b. NOU: transformă formatarea lui Claude (Markdown: **, `, #, -) în formatarea Telegram
+def frumos(text):
+    text = html.escape(text, quote=False)          # <strong> din copy apare ca text, nu strică mesajul
+    linii = []
+    for linie in text.split("\n"):
+        m = re.match(r"^\s*#{1,6}\s+(.*)$", linie)        # # Titlu  ->  titlu îngroșat
+        if m:
+            linie = f"<b>{m.group(1).strip('* ')}</b>"
+        linie = re.sub(r"^(\s*)[-*]\s+", r"\1• ", linie)   # - punct  ->  • punct
+        if re.fullmatch(r"\s*(-{3,}|\*{3,}|_{3,})\s*", linie):
+            linie = ""                                      # --- linii de separare -> rând gol
+        linii.append(linie)
+    text = "\n".join(linii)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)     # **gros**
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text) # `cod` -> text monospace
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)  # [link](url)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def bucati(text, marime=3500):
+    # împarte la paragrafe, ca să nu tăiem o formatare la jumătate
+    parti, curent = [], ""
+    for paragraf in text.split("\n\n"):
+        if curent and len(curent) + len(paragraf) + 2 > marime:
+            parti.append(curent)
+            curent = ""
+        while len(paragraf) > marime:
+            parti.append(paragraf[:marime])
+            paragraf = paragraf[marime:]
+        curent = f"{curent}\n\n{paragraf}" if curent else paragraf
+    if curent:
+        parti.append(curent)
+    return parti
+
+
+BUTOANE = InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Aprob", callback_data="aprob"),
+    InlineKeyboardButton("✏️ Modific", callback_data="modific"),
+]])
+SEMN_APROBARE = "[APROBARE]"
+
+
+async def trimite_frumos(update: Update, text, butoane=False):
+    parti = bucati(text)
+    for i, parte in enumerate(parti):
+        tastatura = BUTOANE if butoane and i == len(parti) - 1 else None   # butoanele sub ultimul mesaj
+        try:
+            await update.effective_message.reply_text(frumos(parte), parse_mode="HTML",
+                                                      disable_web_page_preview=True, reply_markup=tastatura)
+        except Exception:
+            await update.effective_message.reply_text(parte, reply_markup=tastatura)  # text simplu dacă formatarea e refuzată
+
+
 # 12. Partea comună: trimite un text la Claude și răspunde în Telegram
 async def proceseaza(update: Update, text):
     chat_id = update.effective_chat.id
     lacat = lacate.setdefault(chat_id, asyncio.Lock())
     async with lacat:
         progres = {"pas": "⏳ Pornesc…", "start": time.time()}
-        stare = await update.message.reply_text(text_stare(progres))
+        stare = await update.effective_message.reply_text(text_stare(progres))
         stop = asyncio.Event()
         urmarire = asyncio.create_task(arata_progres(update.effective_chat, stare, progres, stop))
         log.info("chat %s · mesaj nou: %s", chat_id, text[:80].replace("\n", " "))
@@ -467,13 +744,34 @@ async def proceseaza(update: Update, text):
     if copy and not eroare_aparuta:
         if copy["gata"]:
             d = copy["durata"]
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"✅ Copywriter-ul a terminat (în {d // 60}m {d % 60:02d}s). Rezultatul e mai jos 👇")
         else:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "⚠️ Copywriter-ul nu a terminat nici după 3 verificări. Scrie „gata?” și îl întreb din nou.")
-    for i in range(0, len(raspuns), 4000):
-        await update.message.reply_text(raspuns[i:i + 4000])
+    # NOU: dacă agentul cere aprobarea, punem butoanele „Aprob” și „Modific” sub mesaj
+    cere_aprobare = SEMN_APROBARE in raspuns or "schimbăm ceva" in raspuns.lower()
+    raspuns = raspuns.replace(SEMN_APROBARE, "").strip()
+    await trimite_frumos(update, raspuns, butoane=cere_aprobare and not eroare_aparuta)
+
+
+# 12b. NOU: cineva a apăsat „Aprob” sau „Modific”
+async def buton_apasat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    apasare = update.callback_query
+    if update.effective_chat.id not in ALLOWED_IDS:
+        await apasare.answer()
+        return
+    await apasare.answer()
+    try:
+        await apasare.edit_message_reply_markup(reply_markup=None)   # scoatem butoanele, să nu fie apăsate de 2 ori
+    except Exception:
+        pass
+    if apasare.data == "aprob":
+        await update.effective_message.reply_text("✅ Aprobat. Merg mai departe…")
+        await proceseaza(update, "Aprob. Mergi mai departe cu pasul următor.")
+    else:
+        await update.effective_message.reply_text("✏️ Scrie-mi ce vrei să schimb.",
+                                                  reply_markup=ForceReply(selective=True))
 
 
 # 13. Mesaj text
@@ -510,7 +808,7 @@ async def nou(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_IDS:
         return
     await inchide_conversatia(update.effective_chat.id)
-    await update.message.reply_text("Gata, conversație nouă. Trimite produsul sau ce vrei să modific.")
+    await update.effective_message.reply_text("Gata, conversație nouă. Trimite produsul sau ce vrei să modific.")
 
 
 async def showusage(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -518,13 +816,14 @@ async def showusage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = text_limita() or ("Încă n-am primit de la Claude informații despre limită în această pornire a botului.\n"
                              "Le vezi oricând pe claude.ai → Settings → Usage.")
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text)
 
 
 # 16. Pornim botul
 app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
 app.add_handler(CommandHandler("nou", nou))
 app.add_handler(CommandHandler("showusage", showusage))
+app.add_handler(CallbackQueryHandler(buton_apasat))
 app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, primeste_poza))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, raspunde))
 log.info("Botul a pornit. Control+C ca să-l oprești.")
