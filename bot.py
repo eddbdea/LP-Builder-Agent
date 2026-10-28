@@ -24,7 +24,9 @@ from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
     TextBlock,
-    ThinkingBlock,        # NOU: Claude gândește
+    ThinkingBlock,
+    ToolResultBlock,      # NOU: rezultatul unei unelte (aici: copywriter-ul a terminat)
+    UserMessage,        # NOU: Claude gândește
     ToolUseBlock,         # aflăm ce unealtă folosește Claude
     RateLimitEvent,
     tool,                 # ca să construim unealta Shopify
@@ -39,6 +41,8 @@ log = logging.getLogger("onyx")
 # 2. Cheile din .env
 load_dotenv()
 os.environ.pop("ANTHROPIC_API_KEY", None)   # folosim abonamentul Pro, nu API-ul
+# NOU: oprim complet „fundalul” – subagenții (copywriter-ul) rulează mereu până la capăt, în același răspuns
+os.environ["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_IDS = {int(x) for x in os.environ["TELEGRAM_ALLOWED_CHAT_ID"].split(",")}
 FOLDER = Path(__file__).parent
@@ -215,6 +219,7 @@ copywriter = AgentDefinition(
     tools=["Read", UNEALTA_SHOPIFY, UNEALTA_POZA],
     model=MODEL_COPY,
     effort=EFFORT_COPY,
+    background=False,     # NOU: agentul principal îl așteaptă să termine (nu-l lasă în fundal)
 )
 
 # 6. Setările agentului principal
@@ -228,6 +233,7 @@ optiuni = ClaudeAgentOptions(
     max_turns=40,
     model=MODEL_RESEARCH,
     effort=EFFORT_RESEARCH,
+    env={"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},   # NOU: același lucru, trimis direct lui Claude
 )
 
 # 7. Câte o conversație pentru fiecare om din echipă
@@ -288,37 +294,110 @@ def descrie_pasul(bucata):
 
 
 # 10. Trimite mesajul în conversație și adună răspunsul
+def text_din_rezultat(continut):
+    # rezultatul copywriter-ului poate veni ca text sau ca listă de bucăți {"type": "text", "text": ...}
+    if isinstance(continut, str):
+        return continut
+    if isinstance(continut, list):
+        return "\n".join(b.get("text", "") for b in continut if isinstance(b, dict))
+    return ""
+
+
 async def intreaba_claude(chat_id, text, progres):
     client = await ia_conversatia(chat_id)
-    await client.query(text)
+    await client.query(text + "\n\n(Dacă folosești copywriter-ul, așteaptă-i rezultatul în acest răspuns; nu-l lăsa în fundal.)")
+    raspuns = await citeste_raspuns(client, chat_id, progres)
+
+    # NOU: plasă de siguranță – dacă răspunsul s-a încheiat, dar copywriter-ul n-a terminat,
+    # îl întrebăm singuri pe agent (de max. 3 ori), ca să nu mai fie nevoie să întrebi tu
+    incercari = 0
+    while progres.get("copy") and not progres["copy"]["gata"] and incercari < 3:
+        incercari += 1
+        log.info("chat %s · copywriter-ul n-a terminat încă, întreb automat (%s/3)", chat_id, incercari)
+        progres["pas"] = "⏳ Aștept copywriter-ul…"
+        await asyncio.sleep(20)
+        await client.query("Așteaptă până termină copywriter-ul și apoi dă-mi rezultatul lui complet, "
+                           "exact cum l-a scris. Nu-l lăsa în fundal.")
+        raspuns_nou = await citeste_raspuns(client, chat_id, progres)
+        if raspuns_nou:
+            raspuns = raspuns_nou
+
+    # dacă agentul principal n-a scris nimic, dar avem rezultatul copywriter-ului, îl trimitem pe acela
+    copy = progres.get("copy")
+    if not raspuns and copy and copy.get("rezultat"):
+        raspuns = copy["rezultat"]
+    return raspuns or "(n-am primit răspuns)"
+
+
+async def citeste_raspuns(client, chat_id, progres):
     raspuns = ""
     async for mesaj in client.receive_response():
+        din_copywriter = bool(getattr(mesaj, "parent_tool_use_id", None))
+
         if isinstance(mesaj, AssistantMessage):
             for bucata in mesaj.content:
+                if din_copywriter:
+                    # ce face copywriter-ul -> al doilea mesaj de stare
+                    copy = progres.get("copy")
+                    if copy and not copy["gata"]:
+                        if isinstance(bucata, ThinkingBlock):
+                            copy["pas"] = "🧠 Gândește…"
+                        elif isinstance(bucata, ToolUseBlock):
+                            copy["pas"] = descrie_pasul(bucata)
+                            log.info("chat %s · copywriter · %s", chat_id, copy["pas"])
+                        elif isinstance(bucata, TextBlock):
+                            copy["pas"] = "📝 Scrie…"
+                    continue
+                # ce face agentul principal -> primul mesaj de stare
                 if isinstance(bucata, ThinkingBlock):
                     progres["pas"] = "🧠 Gândește…"
                 elif isinstance(bucata, ToolUseBlock):
                     progres["pas"] = descrie_pasul(bucata)
                     log.info("chat %s · %s", chat_id, progres["pas"])
+                    if bucata.name in ("Agent", "Task"):
+                        progres["copy"] = {"id": bucata.id, "start": time.time(),
+                                           "pas": "⏳ Pornește…", "gata": False}
                 elif isinstance(bucata, TextBlock):
-                    if mesaj.parent_tool_use_id:
-                        progres["pas"] = "✍️ Copywriter-ul scrie…"
+                    progres["pas"] = "📝 Scrie răspunsul…"
+                    raspuns += bucata.text + "\n"
+
+        # copywriter-ul a terminat când vine rezultatul uneltei Agent
+        if isinstance(mesaj, UserMessage) and isinstance(mesaj.content, list):
+            copy = progres.get("copy")
+            for bucata in mesaj.content:
+                if copy and isinstance(bucata, ToolResultBlock) and bucata.tool_use_id == copy["id"]:
+                    if "async_launched" not in str(bucata.content):
+                        copy["gata"] = True
+                        copy["durata"] = int(time.time() - copy["start"])
+                        copy["rezultat"] = text_din_rezultat(bucata.content).strip()
+                        log.info("chat %s · copywriter gata în %ss", chat_id, copy["durata"])
                     else:
-                        progres["pas"] = "📝 Scrie răspunsul…"
-                        raspuns += bucata.text + "\n"
+                        log.warning("chat %s · copywriter-ul a pornit în fundal", chat_id)
+
         if isinstance(mesaj, RateLimitEvent):
             ultima_limita["info"] = mesaj.rate_limit_info
-    return raspuns.strip() or "(n-am primit răspuns)"
+    return raspuns.strip()
 
 
-# 11. Cât lucrează: „scrie…” sus + mesajul de stare cu pasul curent și timpul scurs
+# 11. Cât lucrează: „scrie…” sus + mesajele de stare (agentul principal și copywriter-ul)
+def ceas(start):
+    secunde = int(time.time() - start)
+    return f"{secunde // 60}m {secunde % 60:02d}s"
+
+
 def text_stare(progres):
-    secunde = int(time.time() - progres["start"])
-    return f"{progres['pas']}\n⏱ {secunde // 60}m {secunde % 60:02d}s · botul merge, nicio eroare"
+    return f"{progres['pas']}\n⏱ {ceas(progres['start'])} · botul merge, nicio eroare"
+
+
+def text_copywriter(copy):
+    if copy["gata"]:
+        d = copy["durata"]
+        return f"✅ Copywriter-ul (Opus) a terminat în {d // 60}m {d % 60:02d}s"
+    return f"✍️ Copywriter-ul (Opus) lucrează\n{copy['pas']}\n⏱ {ceas(copy['start'])} · merge, nu s-a oprit"
 
 
 async def arata_progres(chat, stare, progres, stop):
-    ultimul_text = ""
+    ultimul_text, ultimul_copy = "", ""
     while not stop.is_set():
         try:
             await chat.send_action(ChatAction.TYPING)
@@ -326,11 +405,28 @@ async def arata_progres(chat, stare, progres, stop):
             if text != ultimul_text:
                 await stare.edit_text(text)
                 ultimul_text = text
+            copy = progres.get("copy")
+            if copy:
+                text_c = text_copywriter(copy)
+                if "mesaj" not in copy:
+                    copy["mesaj"] = await chat.send_message(text_c)
+                    ultimul_copy = text_c
+                elif text_c != ultimul_copy:
+                    await copy["mesaj"].edit_text(text_c)
+                    ultimul_copy = text_c
         except Exception:
             pass   # dacă Telegram refuză o editare, încercăm din nou la următorul pas
         try:
             await asyncio.wait_for(stop.wait(), timeout=5)
         except asyncio.TimeoutError:
+            pass
+    # la final: mesajul copywriter-ului rămâne cu ✅ (sau îl actualizăm o ultimă dată)
+    copy = progres.get("copy")
+    if copy and "mesaj" in copy:
+        try:
+            await copy["mesaj"].edit_text(text_copywriter(copy) if copy["gata"]
+                                          else "⚠️ Copywriter-ul nu a trimis rezultatul în acest răspuns.")
+        except Exception:
             pass
 
 
@@ -366,6 +462,16 @@ async def proceseaza(update: Update, text):
                 await stare.delete()
         except Exception:
             pass
+    # NOU: anunț clar, ca mesaj nou (cu notificare), că a terminat copywriter-ul
+    copy = progres.get("copy")
+    if copy and not eroare_aparuta:
+        if copy["gata"]:
+            d = copy["durata"]
+            await update.message.reply_text(
+                f"✅ Copywriter-ul a terminat (în {d // 60}m {d % 60:02d}s). Rezultatul e mai jos 👇")
+        else:
+            await update.message.reply_text(
+                "⚠️ Copywriter-ul nu a terminat nici după 3 verificări. Scrie „gata?” și îl întreb din nou.")
     for i in range(0, len(raspuns), 4000):
         await update.message.reply_text(raspuns[i:i + 4000])
 
