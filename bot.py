@@ -1,5 +1,5 @@
 # Agentul SuperPractic pe Telegram
-# Research-ul îl face agentul principal (Sonnet); copy-ul și pagina le face agentul „copywriter” (Opus).
+# Research-ul îl face agentul principal; copy-ul îl scrie agentul „copywriter”. Modelele se aleg din .env.
 # Are unealta Shopify, ține minte conversația până dai /nou, vede pozele și arată ce face pe parcurs
 # (pasul curent + cât timp lucrează), iar în terminal scrie fiecare pas și erorile complete.
 # Poate încărca în Shopify pozele primite pe Telegram (la produs sau în Content → Files).
@@ -61,8 +61,9 @@ API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-10")
 
 MODEL_RESEARCH = os.getenv("MODEL_RESEARCH", "sonnet")
 EFFORT_RESEARCH = os.getenv("EFFORT_RESEARCH", "medium")
-MODEL_COPY = os.getenv("MODEL_COPY", "claude-opus-5-5")
-EFFORT_COPY = os.getenv("EFFORT_COPY", "medium")
+MODEL_COPY = os.getenv("MODEL_COPY", "sonnet")
+EFFORT_COPY = os.getenv("EFFORT_COPY", "high")
+NUME_MODEL_COPY = "Opus" if "opus" in MODEL_COPY.lower() else "Sonnet" if "sonnet" in MODEL_COPY.lower() else MODEL_COPY
 
 
 # 3. Tokenul Shopify (expiră la 24h, îl cerem din nou singuri)
@@ -429,7 +430,7 @@ UNEALTA_SHOPIFY = "mcp__shopify__shopify_graphql"
 UNEALTA_POZA = "mcp__shopify__incarca_poza"
 UNEALTA_PAGINA = "mcp__shopify__creeaza_pagina"
 
-# 5. Al doilea agent: copywriter-ul (Opus) – are și Shopify
+# 5. Al doilea agent: copywriter-ul – are și Shopify
 copywriter = AgentDefinition(
     description="Scrie copy-ul paginii de produs (Pasul 2) și orice modificare de text, după CLAUDE.md.",
     prompt="Ești copywriter-ul SuperPractic. Scrii copy-ul în formatul fix din CLAUDE.md, "
@@ -614,8 +615,8 @@ def text_stare(progres):
 def text_copywriter(copy):
     if copy["gata"]:
         d = copy["durata"]
-        return f"✅ Copywriter-ul (Opus) a terminat în {d // 60}m {d % 60:02d}s"
-    return f"✍️ Copywriter-ul (Opus) lucrează\n{copy['pas']}\n⏱ {ceas(copy['start'])} · merge, nu s-a oprit"
+        return f"✅ Copywriter-ul ({NUME_MODEL_COPY}) a terminat în {d // 60}m {d % 60:02d}s"
+    return f"✍️ Copywriter-ul ({NUME_MODEL_COPY}) lucrează\n{copy['pas']}\n⏱ {ceas(copy['start'])} · merge, nu s-a oprit"
 
 
 async def arata_progres(chat, stare, progres, stop):
@@ -782,22 +783,68 @@ async def raspunde(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # 14. Poză (trimisă ca poză sau ca fișier)
+# NOU: pozele trimise „ca fișier” vin în formatul original (HEIC de pe iPhone, PNG mare etc.),
+# pe care Claude nu le poate deschide. Le facem o copie JPG, micșorată, doar pentru „ochii” lui Claude.
+EXTENSII_POZA = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".bmp", ".tif", ".tiff", ".avif"}
+FORMATE_SHOPIFY = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+LIMITA_TELEGRAM = 20 * 1024 * 1024    # un bot Telegram poate descărca fișiere de max. 20 MB
+
+
+def copie_pentru_claude(cale):
+    from PIL import Image, ImageOps
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()                      # ca Pillow să poată deschide HEIC de pe iPhone
+    except ImportError:
+        pass
+    with Image.open(cale) as img:
+        img = ImageOps.exif_transpose(img)          # rotită corect, ca în telefon
+        img = img.convert("RGB")
+        img.thumbnail((2000, 2000))                 # destul de mare ca să vadă detaliile
+        copie = cale.with_name(cale.stem + "-vizualizare.jpg")
+        img.save(copie, "JPEG", quality=88)
+    return copie
+
+
 async def primeste_poza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_IDS:
         return
-    if update.message.photo:
-        fisier_tg = update.message.photo[-1]          # cea mai mare rezoluție
+    mesaj = update.message
+    if mesaj.photo:
+        fisier_tg = mesaj.photo[-1]                  # cea mai mare rezoluție
         extensie = ".jpg"
     else:
-        fisier_tg = update.message.document           # poză trimisă ca fișier
-        extensie = Path(fisier_tg.file_name or "poza.jpg").suffix or ".jpg"
+        fisier_tg = mesaj.document                   # poză trimisă ca fișier
+        extensie = Path(fisier_tg.file_name or "").suffix.lower()
+        este_poza = (fisier_tg.mime_type or "").startswith("image/") or extensie in EXTENSII_POZA
+        if not este_poza:
+            await mesaj.reply_text("Pot să mă uit doar la poze (JPG, PNG, HEIC, WEBP). "
+                                   "Fișierul ăsta nu pare să fie o poză.")
+            return
+        extensie = extensie or ".jpg"
+    if (fisier_tg.file_size or 0) > LIMITA_TELEGRAM:
+        await mesaj.reply_text("Poza are peste 20 MB și Telegram nu mă lasă s-o descarc. "
+                               "Trimite-o ca poză (nu ca fișier) sau micșoreaz-o puțin.")
+        return
+
     fisier = await fisier_tg.get_file()
     cale = POZE / f"{fisier_tg.file_unique_id}{extensie}"
     await fisier.download_to_drive(cale)
-    text_insotitor = update.message.caption or "Uită-te la poză și spune-mi ce produs e."
+    log.info("chat %s · poză primită: %s (%s KB)", mesaj.chat_id, cale.name, cale.stat().st_size // 1024)
+
+    try:
+        vizualizare = await asyncio.to_thread(copie_pentru_claude, cale)
+    except Exception:
+        log.exception("Nu am putut deschide poza %s", cale)
+        await mesaj.reply_text("Nu am putut deschide poza asta. Încearcă s-o trimiți ca poză, nu ca fișier.")
+        return
+    pentru_shopify = cale if extensie in FORMATE_SHOPIFY else vizualizare
+
+    text_insotitor = mesaj.caption or "Uită-te la poză și spune-mi ce produs e."
     prompt = (
-        f"Utilizatorul a trimis o poză, salvată la: {cale}\n"
-        f"Deschide-o cu unealta Read ca s-o vezi.\n"
+        f"Utilizatorul a trimis o poză.\n"
+        f"Ca s-o vezi, deschide cu unealta Read: {vizualizare}\n"
+        f"Dacă trebuie urcată în Shopify, folosește fișierul: {pentru_shopify}\n"
         f"Mesajul lui: {text_insotitor}"
     )
     await proceseaza(update, prompt)
@@ -824,7 +871,7 @@ app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
 app.add_handler(CommandHandler("nou", nou))
 app.add_handler(CommandHandler("showusage", showusage))
 app.add_handler(CallbackQueryHandler(buton_apasat))
-app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, primeste_poza))
+app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, primeste_poza))   # NOU: orice fișier
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, raspunde))
 log.info("Botul a pornit. Control+C ca să-l oprești.")
 app.run_polling()
